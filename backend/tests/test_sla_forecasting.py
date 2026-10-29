@@ -17,15 +17,17 @@ class FakeSupabaseTable:
         self.rows = rows
         self._updates = None
         self._target_id = None
+        self._filters = {}
 
     def select(self, *_args, **_kwargs):
         """Select all rows in the mock table."""
         return self
 
     def eq(self, key: str, value: str):
-        """Record an equality filter on the ticket id."""
+        """Record an equality filter on the ticket query."""
         if key == "id":
             self._target_id = value
+        self._filters[key] = value
         return self
 
     def neq(self, *_args, **_kwargs):
@@ -38,13 +40,16 @@ class FakeSupabaseTable:
         return self
 
     def execute(self):
-        """Apply any staged updates and return a response object."""
+        """Apply any staged updates and return a filtered response object."""
         if self._updates is not None and self._target_id is not None:
             for r in self.rows:
                 if str(r.get("id")) == str(self._target_id):
                     r.update(self._updates)
             self._updates = None
-        return type("Resp", (), {"data": list(self.rows)})()
+        matched = list(self.rows)
+        for k, v in self._filters.items():
+            matched = [r for r in matched if str(r.get(k)) == str(v)]
+        return type("Resp", (), {"data": matched})()
 
 
 class FakeSupabaseClient:
@@ -112,17 +117,23 @@ def test_high_risk_threshold_tags_ticket_and_triggers_webhook(monkeypatch):
     assert len(webhook_calls) == 1
 
 
-def test_company_risk_distribution():
-    """Verify get_company_risk_distribution aggregates low, medium, and high risk buckets accurately."""
-    svc = SLAForecastingService()
+def test_company_risk_distribution(monkeypatch):
+    """Verify get_company_risk_distribution aggregates buckets without sending notifications."""
+    svc = SLAForecastingService(webhook_url="https://hooks.example.com/sla")
+    webhook_calls = []
+    monkeypatch.setattr(
+        svc,
+        "notify_on_duty_leads",
+        lambda ticket, probability, webhook_url="": webhook_calls.append(ticket["id"]) or True,
+    )
     tickets = [
         {
             "id": "t-1",
             "company_id": "acme",
             "subject": "Minor UI typo",
             "description": "Label alignment",
-            "queue_depth": 0,
-            "historical_velocity": 8.0,
+            "queue_depth": None,
+            "historical_velocity": None,
         },
         {
             "id": "t-2",
@@ -141,3 +152,4 @@ def test_company_risk_distribution():
     assert summary["risk_distribution"]["high"] == 1
     assert summary["risk_distribution"]["low"] == 1
     assert len(summary["high_risk_tickets"]) == 1
+    assert len(webhook_calls) == 0
