@@ -4,9 +4,9 @@ Agentic Self-Healing Actions Engine - Sandboxed Playbook Execution for Automated
 Provides:
   - Playbook registry with strict parameter schema validation
   - Dry-run execution mode (dry_run=True)
-  - Constant-time HMAC-SHA256 token verification for playbook execution
-  - Audit logging to Supabase `action_execution_logs` table
-  - Auto-deflection feedback loop updating ticket status to `resolved` with diagnostic summary
+  - Constant-time HMAC-SHA256 token verification bound to ticket, playbook, params, dry_run, and tenant
+  - Audit logging to Supabase `action_execution_logs` table (including failed handler runs)
+  - Auto-deflection feedback loop updating ticket status to `resolved` and posting a diagnostic summary note
 """
 
 import hashlib
@@ -14,13 +14,15 @@ import hmac
 import json
 import logging
 import os
+import time
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
 
 
 def _utc_now_iso() -> str:
+    """Return the current UTC timestamp formatted as an ISO-8601 string."""
     return datetime.now(timezone.utc).isoformat()
 
 
@@ -63,12 +65,11 @@ DEFAULT_PLAYBOOKS: Dict[str, Dict[str, Any]] = {
 class AgenticActionEngine:
     """Executes deterministic, sandboxed Tier-1 remediation playbooks with HMAC verification."""
 
-    def __init__(self, secret_key: Optional[str] = None):
-        self.secret_key = (
-            secret_key
-            or os.getenv("AGENTIC_ACTION_HMAC_SECRET")
-            or "default-agentic-hmac-secret-key"
-        )
+    def __init__(self, secret_key: Optional[str] = None, max_token_age_seconds: int = 300):
+        """Initialize the engine with an explicit or environment-configured HMAC secret."""
+        self.secret_key: Optional[str] = secret_key or os.getenv("AGENTIC_ACTION_HMAC_SECRET")
+        self.max_token_age_seconds: int = max_token_age_seconds
+        self._used_nonces: Set[str] = set()
         self._playbooks: Dict[str, Dict[str, Any]] = dict(DEFAULT_PLAYBOOKS)
         self._handlers: Dict[str, Callable[[Dict[str, Any], bool], Dict[str, Any]]] = {
             "password_reset": self._handle_password_reset,
@@ -151,13 +152,32 @@ class AgenticActionEngine:
     # ------------------------------------------------------------------
 
     def generate_hmac_token(
-        self, ticket_id: str, playbook_name: str, params: Dict[str, Any]
+        self,
+        ticket_id: str,
+        playbook_name: str,
+        params: Dict[str, Any],
+        dry_run: bool = False,
+        company_id: Optional[str] = None,
+        timestamp: Optional[int] = None,
+        nonce: Optional[str] = None,
     ) -> str:
-        """Compute canonical HMAC-SHA256 signature for an execution payload."""
+        """Compute canonical HMAC-SHA256 signature bound to execution context and freshness."""
+        if not self.secret_key:
+            raise RuntimeError("AGENTIC_ACTION_HMAC_SECRET is not configured.")
+
         canonical_params = json.dumps(params or {}, sort_keys=True, separators=(",", ":"))
-        message = f"{ticket_id}:{playbook_name}:{canonical_params}".encode("utf-8")
+        tenant_part = company_id or ""
+        mode_part = "1" if dry_run else "0"
+        base_msg = f"{ticket_id}:{playbook_name}:{mode_part}:{tenant_part}:{canonical_params}"
+        if timestamp is not None or nonce is not None:
+            ts_str = str(timestamp if timestamp is not None else int(time.time()))
+            nonce_str = nonce or ""
+            base_msg = f"{base_msg}:{ts_str}:{nonce_str}"
+
         return hmac.new(
-            self.secret_key.encode("utf-8"), message, hashlib.sha256
+            self.secret_key.encode("utf-8"),
+            base_msg.encode("utf-8"),
+            hashlib.sha256,
         ).hexdigest()
 
     def verify_hmac_token(
@@ -166,12 +186,39 @@ class AgenticActionEngine:
         playbook_name: str,
         params: Dict[str, Any],
         token: Optional[str],
+        dry_run: bool = False,
+        company_id: Optional[str] = None,
+        timestamp: Optional[int] = None,
+        nonce: Optional[str] = None,
     ) -> bool:
-        """Verify HMAC-SHA256 signature in constant time."""
-        if not token or not isinstance(token, str):
+        """Verify HMAC-SHA256 signature in constant time using UTF-8 bytes and freshness checks."""
+        if not self.secret_key or not token or not isinstance(token, str):
             return False
-        expected = self.generate_hmac_token(ticket_id, playbook_name, params)
-        return hmac.compare_digest(expected, token)
+
+        if timestamp is not None:
+            now_ts = int(time.time())
+            if abs(now_ts - int(timestamp)) > self.max_token_age_seconds:
+                return False
+
+        if nonce is not None and nonce in self._used_nonces:
+            return False
+
+        expected = self.generate_hmac_token(
+            ticket_id=ticket_id,
+            playbook_name=playbook_name,
+            params=params,
+            dry_run=dry_run,
+            company_id=company_id,
+            timestamp=timestamp,
+            nonce=nonce,
+        )
+        matched = hmac.compare_digest(
+            expected.encode("utf-8"),
+            token.encode("utf-8", errors="replace"),
+        )
+        if matched and nonce is not None:
+            self._used_nonces.add(nonce)
+        return matched
 
     # ------------------------------------------------------------------
     # Execution, Audit Logging & Auto-Deflection Loop
@@ -186,19 +233,30 @@ class AgenticActionEngine:
         supabase_client: Any = None,
         dry_run: bool = False,
         company_id: Optional[str] = None,
+        timestamp: Optional[int] = None,
+        nonce: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Validate, authorize, and execute a sandboxed playbook.
 
         When dry_run=False and execution succeeds, logs the execution to
-        `action_execution_logs` and resolves the ticket with a diagnostic summary note.
+        `action_execution_logs`, posts a diagnostic summary note, and resolves the ticket.
         """
         if not ticket_id or not isinstance(ticket_id, str):
             raise PlaybookValidationError("ticket_id must be a non-empty string.")
 
         self.validate_playbook_params(playbook_name, params)
 
-        if not self.verify_hmac_token(ticket_id, playbook_name, params, hmac_token):
+        if not self.verify_hmac_token(
+            ticket_id=ticket_id,
+            playbook_name=playbook_name,
+            params=params,
+            token=hmac_token,
+            dry_run=dry_run,
+            company_id=company_id,
+            timestamp=timestamp,
+            nonce=nonce,
+        ):
             self._record_audit_log(
                 supabase_client,
                 ticket_id=ticket_id,
@@ -212,7 +270,21 @@ class AgenticActionEngine:
             raise PlaybookAuthorizationError("Invalid or missing HMAC authorization token.")
 
         handler = self._handlers[playbook_name]
-        execution_output = handler(params, dry_run)
+        try:
+            execution_output = handler(params, dry_run)
+        except Exception as exc:
+            self._record_audit_log(
+                supabase_client,
+                ticket_id=ticket_id,
+                playbook_name=playbook_name,
+                params=params,
+                dry_run=dry_run,
+                status="failed",
+                diagnostic_summary=f"Handler raised {type(exc).__name__}.",
+                company_id=company_id,
+            )
+            raise
+
         executed_at = _utc_now_iso()
 
         status = "dry_run_success" if dry_run else "succeeded"
@@ -264,6 +336,7 @@ class AgenticActionEngine:
         diagnostic_summary: str,
         company_id: Optional[str] = None,
     ) -> Dict[str, Any]:
+        """Insert an execution audit entry into `action_execution_logs`."""
         payload: Dict[str, Any] = {
             "ticket_id": ticket_id,
             "playbook_name": playbook_name,
@@ -294,12 +367,12 @@ class AgenticActionEngine:
         playbook_name: str,
         diagnostic_summary: str,
     ) -> bool:
+        """Resolve the ticket and append an automated diagnostic summary note."""
+        formatted_note = f"[Auto-Deflected via '{playbook_name}'] {diagnostic_summary}"
         updates = {
             "status": "resolved",
             "resolved_at": _utc_now_iso(),
-            "resolution_note": (
-                f"[Auto-Deflected via '{playbook_name}'] {diagnostic_summary}"
-            ),
+            "resolution_note": formatted_note,
         }
         try:
             res = (
@@ -308,6 +381,16 @@ class AgenticActionEngine:
                 .eq("id", ticket_id)
                 .execute()
             )
+            supabase_client.table("ticket_messages").insert(
+                {
+                    "ticket_id": ticket_id,
+                    "sender_name": "Agentic Action Engine",
+                    "message": formatted_note,
+                    "message_type": "text",
+                    "is_internal": True,
+                    "created_at": _utc_now_iso(),
+                }
+            ).execute()
             return bool(getattr(res, "data", None))
         except Exception as exc:
             logger.error(f"[AgenticActionEngine] Failed to update ticket {ticket_id}: {exc}")
@@ -319,6 +402,7 @@ class AgenticActionEngine:
 
     @staticmethod
     def _handle_password_reset(params: Dict[str, Any], dry_run: bool) -> Dict[str, Any]:
+        """Execute or simulate the sandboxed password reset playbook."""
         email = params["user_email"]
         mode = "DRY-RUN" if dry_run else "EXECUTED"
         return {
@@ -332,6 +416,7 @@ class AgenticActionEngine:
 
     @staticmethod
     def _handle_vpn_cert_refresh(params: Dict[str, Any], dry_run: bool) -> Dict[str, Any]:
+        """Execute or simulate the sandboxed VPN client certificate refresh playbook."""
         email = params["user_email"]
         device_id = params["device_id"]
         mode = "DRY-RUN" if dry_run else "EXECUTED"
@@ -347,6 +432,7 @@ class AgenticActionEngine:
 
     @staticmethod
     def _handle_dns_flush(params: Dict[str, Any], dry_run: bool) -> Dict[str, Any]:
+        """Execute or simulate the sandboxed DNS resolver cache flush playbook."""
         hostname = params["hostname"]
         record_type = params.get("record_type", "A")
         mode = "DRY-RUN" if dry_run else "EXECUTED"
