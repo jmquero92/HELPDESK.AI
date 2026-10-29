@@ -121,20 +121,69 @@ class SLAForecastingService:
         raw_score = (0.45 * queue_component) + (0.35 * complexity) + (0.20 * velocity_drag)
         return round(max(0.0, min(1.0, raw_score)), 4)
 
+    @staticmethod
+    def _derive_queue_depth(ticket: Dict[str, Any], supabase_client: Any = None) -> int:
+        """Derive active technician ticket queue depth from ticket payload or repository."""
+        raw_qd = ticket.get("queue_depth")
+        if raw_qd is not None:
+            return max(0, int(raw_qd))
+
+        assignee = ticket.get("assigned_to") or ticket.get("technician_id")
+        if supabase_client is not None and assignee:
+            try:
+                res = (
+                    supabase_client.table("tickets")
+                    .select("id")
+                    .eq("assigned_to", assignee)
+                    .neq("status", "resolved")
+                    .neq("status", "closed")
+                    .execute()
+                )
+                rows = getattr(res, "data", None) or []
+                return len(rows)
+            except Exception as exc:
+                logger.warning(f"[SLAForecast] Failed to derive queue depth for {assignee}: {exc}")
+        return 0
+
+    @staticmethod
+    def _derive_historical_velocity(ticket: Dict[str, Any], supabase_client: Any = None) -> float:
+        """Derive department historical resolution velocity from ticket payload or repository."""
+        raw_hv = ticket.get("historical_velocity")
+        if raw_hv is not None:
+            return max(0.1, float(raw_hv))
+
+        dept = ticket.get("department") or ticket.get("department_id") or ticket.get("category")
+        if supabase_client is not None and dept:
+            try:
+                res = (
+                    supabase_client.table("tickets")
+                    .select("id")
+                    .eq("department", dept)
+                    .eq("status", "resolved")
+                    .execute()
+                )
+                rows = getattr(res, "data", None) or []
+                if rows:
+                    return max(0.1, round(len(rows) / 24.0, 4))
+            except Exception as exc:
+                logger.warning(f"[SLAForecast] Failed to derive velocity for {dept}: {exc}")
+        return 2.0
+
     def evaluate_ticket(
         self,
         ticket: Dict[str, Any],
         supabase_client: Any = None,
         webhook_url: Optional[str] = None,
+        notify: bool = True,
     ) -> Dict[str, Any]:
         """
         Evaluate a ticket's SLA breach probability, auto-tag with `risk:high-breach`
-        and notify on-duty leads via webhook when P(breach) > 0.75.
+        and optionally notify on-duty leads via webhook when P(breach) > 0.75.
         """
         ticket_id = str(ticket.get("id", "unknown"))
         description = f"{ticket.get('subject', '')} {ticket.get('description', '')}".strip()
-        queue_depth = int(ticket.get("queue_depth", 0))
-        velocity = float(ticket.get("historical_velocity", 2.0))
+        queue_depth = self._derive_queue_depth(ticket, supabase_client=supabase_client)
+        velocity = self._derive_historical_velocity(ticket, supabase_client=supabase_client)
         complexity_override = ticket.get("semantic_complexity")
 
         prob = self.calculate_breach_probability(
@@ -151,7 +200,7 @@ class SLAForecastingService:
 
         webhook_sent = False
         if is_high_risk:
-            if supabase_client is not None and ticket.get("id"):
+            if supabase_client is not None and ticket.get("id") and notify:
                 try:
                     (
                         supabase_client.table("tickets")
@@ -168,11 +217,12 @@ class SLAForecastingService:
                 except Exception as exc:
                     logger.error(f"[SLAForecast] Failed to tag ticket {ticket_id}: {exc}")
 
-            webhook_sent = self.notify_on_duty_leads(
-                ticket=ticket,
-                probability=prob,
-                webhook_url=webhook_url or self.webhook_url,
-            )
+            if notify:
+                webhook_sent = self.notify_on_duty_leads(
+                    ticket=ticket,
+                    probability=prob,
+                    webhook_url=webhook_url or self.webhook_url,
+                )
 
         risk_tier = "high" if is_high_risk else ("medium" if prob >= 0.4 else "low")
         return {
@@ -237,7 +287,7 @@ class SLAForecastingService:
         distribution = {"low": 0, "medium": 0, "high": 0}
         evaluated: List[Dict[str, Any]] = []
         for t in tickets:
-            ev = self.evaluate_ticket(t, supabase_client=None)
+            ev = self.evaluate_ticket(t, supabase_client=supabase_client, notify=False)
             distribution[ev["risk_tier"]] += 1
             evaluated.append(ev)
 
