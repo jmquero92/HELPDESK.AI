@@ -25,22 +25,26 @@ router = APIRouter(prefix="/actions", tags=["Agentic Actions"])
 
 
 class ExecutePlaybookRequest(BaseModel):
+    """Request schema for executing or simulating a registered remediation playbook."""
+
     ticket_id: str = Field(..., description="Target ticket identifier")
     playbook_name: str = Field(..., description="Registered playbook name")
     parameters: Dict[str, Any] = Field(default_factory=dict)
     hmac_token: str = Field(..., description="HMAC-SHA256 authorization token")
     dry_run: bool = Field(default=False, description="Validate and simulate without mutating state")
     company_id: Optional[str] = Field(default=None)
+    timestamp: Optional[int] = Field(default=None, description="Optional unix timestamp bound to token")
+    nonce: Optional[str] = Field(default=None, description="Optional single-use nonce bound to token")
 
 
 @router.get("/playbooks")
-async def get_registered_playbooks():
+def get_registered_playbooks():
     """Return all allowed deterministic self-healing playbooks."""
     return {"playbooks": agentic_action_engine.list_playbooks()}
 
 
 @router.post("/execute")
-async def execute_playbook_endpoint(payload: ExecutePlaybookRequest):
+def execute_playbook_endpoint(payload: ExecutePlaybookRequest):
     """Execute a sandboxed remediation playbook with HMAC verification and audit logging."""
     try:
         result = agentic_action_engine.execute_playbook(
@@ -51,6 +55,8 @@ async def execute_playbook_endpoint(payload: ExecutePlaybookRequest):
             supabase_client=supabase,
             dry_run=payload.dry_run,
             company_id=payload.company_id,
+            timestamp=payload.timestamp,
+            nonce=payload.nonce,
         )
         return result
     except PlaybookValidationError as exc:
@@ -63,7 +69,7 @@ async def execute_playbook_endpoint(payload: ExecutePlaybookRequest):
 
 
 @router.get("/logs")
-async def list_action_execution_logs(
+def list_action_execution_logs(
     ticket_id: Optional[str] = Query(default=None),
     limit: int = Query(default=50, ge=1, le=500),
 ):
