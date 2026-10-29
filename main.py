@@ -15,6 +15,8 @@ from backend.routers import metrics as metrics_router
 from backend.routers import tickets, ai, admin, health, auth, websocket, sla_prediction, ticket_merge, actions
 from backend.routes import translation, estimator, voice, privacy, active_learning, weekly_digest
 from backend.routers import upload as upload_router
+from backend.auth.tenant_middleware import security_manager
+from backend.services.sla_forecasting_service import sla_forecasting_service
 
 from backend.logger import configure_logging
 configure_logging()
@@ -73,6 +75,23 @@ app.include_router(privacy.router)
 app.include_router(active_learning.router)
 app.include_router(weekly_digest.router)
 app.include_router(actions.router)
+
+
+@app.get("/internal/sla/forecast", tags=["SLA Prediction"])
+async def get_internal_sla_forecast(
+    company_id: str | None = None,
+    user: dict = Depends(security_manager.get_current_user_profile),
+):
+    """Return real-time SLA breach risk distribution for the authenticated tenant."""
+    tenant_company_id = user.get("company_id")
+    if not tenant_company_id:
+        raise HTTPException(status_code=403, detail="User not associated with a company")
+    if company_id and company_id != tenant_company_id:
+        raise HTTPException(status_code=403, detail="Cross-tenant SLA forecast access denied")
+    return sla_forecasting_service.get_company_risk_distribution(
+        supabase_client=supabase,
+        company_id=tenant_company_id,
+    )
 
 
 # ---------------------------------------------------------------------------
